@@ -1,0 +1,81 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ipv6-manager-script
+  namespace: kube-system
+data:
+  manage-ipv6.sh: |
+    #!/bin/bash
+    set -e
+
+    # Login using Workload Identity
+    az login --service-principal -u $AZURE_CLIENT_ID -t $AZURE_TENANT_ID \
+             --federated-token $(cat $AZURE_FEDERATED_TOKEN_FILE)
+
+    # 1. Metadata Collection
+    VM_NAME=$(curl -s -H Metadata:true "http://169.254.169.254/metadata/instance/compute/name?api-version=2021-02-01&format=text")
+    RG=$(curl -s -H Metadata:true "http://169.254.169.254/metadata/instance/compute/resourceGroupName?api-version=2021-02-01&format=text")
+    LOCATION=$(curl -s -H Metadata:true "http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text")
+    
+    PREFIX_BASE_NAME="aks-ipv6-prefix"
+    PIP_NAME="pip-v6-${VM_NAME}"
+    
+    # Check if Public IP already exists (Idempotency)
+    EXISTING_PIP=$(az network public-ip show -g $RG -n $PIP_NAME --query id -o tsv 2>/dev/null || true)
+    
+    if [ -n "$EXISTING_PIP" ]; then
+      echo "Public IP $PIP_NAME already exists. Skipping creation."
+    else
+      # 2. Iterative Creation Loop
+      ITERATOR=1
+      SUCCESS=false
+
+      while [ "$SUCCESS" = false ]; do
+        CURRENT_PREFIX_NAME="${PREFIX_BASE_NAME}-${ITERATOR}"
+        
+        # Ensure Prefix exists
+        PREFIX_ID=$(az network public-ip prefix show -g $RG -n $CURRENT_PREFIX_NAME --query id -o tsv 2>/dev/null || true)
+        
+        if [ -z "$PREFIX_ID" ]; then
+          echo "Prefix ${CURRENT_PREFIX_NAME} does not exist. Creating new prefix..."
+          PREFIX_ID=$(az network public-ip prefix create -g $RG -n $CURRENT_PREFIX_NAME \
+            --length 124 --version IPv6 --location $LOCATION --query id -o tsv)
+        fi
+
+        echo "Attempting to create IP in prefix: ${CURRENT_PREFIX_NAME}..."
+        
+        # Try to create the IP. Capture stderr to check for 'OutOfIpAddresses'
+        ERROR_MSG=$(az network public-ip create -g $RG -n $PIP_NAME \
+          --version IPv6 --sku Standard --public-ip-prefix "$PREFIX_ID" \
+          --tags managedBy=ipv6-assigner 2>&1 || true)
+
+        if [[ "$ERROR_MSG" == *"PublicIpPrefixOutOfIpAddresses"* ]]; then
+          echo "Prefix ${CURRENT_PREFIX_NAME} is actually full. Trying next prefix..."
+          ITERATOR=$((ITERATOR + 1))
+        elif [[ "$ERROR_MSG" == *"ERROR"* ]]; then
+          echo "Fatal Azure Error: $ERROR_MSG"
+          exit 1
+        else
+          echo "Successfully created Public IP in ${CURRENT_PREFIX_NAME}."
+          SUCCESS=true
+        fi
+      done
+    fi
+
+    # 3. NIC and Subnet Retrieval
+    NIC_ID=$(az vm show -g $RG -n $VM_NAME --query "networkProfile.networkInterfaces[0].id" -o tsv)
+    NIC_NAME=$(echo $NIC_ID | cut -d'/' -f9)
+    SUBNET_ID=$(az network nic show -g $RG -n $NIC_NAME --query "ipConfigurations[0].subnet.id" -o tsv)
+
+    # 4. Attach IP Config
+    if ! az network nic ip-config show -g $RG --nic-name $NIC_NAME -n ipconfig-v6 > /dev/null 2>&1; then
+      echo "Attaching ipconfig-v6 to NIC: ${NIC_NAME} using Subnet: ${SUBNET_ID}"
+      az network nic ip-config create -g $RG \
+        --nic-name $NIC_NAME \
+        -n ipconfig-v6 \
+        --public-ip-address $PIP_NAME \
+        --private-ip-address-version IPv6 \
+        --subnet "$SUBNET_ID"
+    else
+      echo "IP Config already exists for ${VM_NAME}"
+    fi

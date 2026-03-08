@@ -1,0 +1,29 @@
+apiVersion: "cilium.io/v2"
+kind: CiliumLocalRedirectPolicy
+metadata:
+  name: "dns-hijack-global"
+  namespace: kube-system
+spec:
+  redirectFrontend:
+    # This matches the destination IP currently in your pods' /etc/resolv.conf
+    addressMatcher:
+      ip: "168.63.129.16"
+      toPorts:
+        - port: "53"
+          protocol: UDP
+          name: dns-udp
+        - port: "53"
+          protocol: TCP
+          name: dns-tcp
+  redirectBackend:
+    # This tells Cilium to send that traffic to the CoreDNS pod on the SAME node
+    localEndpointSelector:
+      matchLabels:
+        k8s-app: kube-dns
+    toPorts:
+      - port: "53"
+        protocol: UDP
+        name: dns-udp
+      - port: "53"
+        protocol: TCP
+        name: dns-tcp

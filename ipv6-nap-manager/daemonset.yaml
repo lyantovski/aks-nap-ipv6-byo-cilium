@@ -1,0 +1,38 @@
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-ipv6-assigner
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: ipv6-assigner
+  template:
+    metadata:
+      labels:
+        app: ipv6-assigner
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: ipv6-manager-sa
+      hostNetwork: true
+      hostPID: true
+      containers:
+      - name: assigner
+        image: mcr.microsoft.com/azure-cli:latest
+        command: ["/bin/bash", "-c"]
+        # Added 'apk add' to ensure 'awk' and other utils are present just in case
+        args: 
+          - |
+            /bin/bash /scripts/manage-ipv6.sh
+            sleep infinity
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+      volumes:
+      - name: scripts
+        configMap:
+          name: ipv6-manager-script
+          defaultMode: 0744
